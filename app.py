@@ -1,0 +1,494 @@
+from flask import Flask, render_template, request
+from PIL import Image
+import imagehash
+import os
+import threading
+import difflib
+import requests
+import time
+
+app = Flask(__name__, template_folder='plagirism/templates', static_folder='plagirism')
+app.config['UPLOAD_FOLDER'] = 'plagirism/uploads'
+
+# Google Custom Search API credentials (use environment variables in production)
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
+GOOGLE_CSE_ID = os.getenv('GOOGLE_CSE_ID', '')
+# Hugging Face Inference API (optional)
+HF_API_TOKEN = os.getenv('HF_API_TOKEN', '')
+HF_MODEL_ID = os.getenv('HF_MODEL_ID', 'sentence-transformers/all-MiniLM-L6-v2')
+USE_HF_API = bool(HF_API_TOKEN)
+
+# Ensure upload folder exists
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Lazy-load sentence transformer model on demand (text only)
+embedder = None
+ml_packages_installed = False
+ml_loading_status = {'status': 'not_started', 'message': '', 'progress': 0}
+MODEL_NAME = os.getenv('SENTENCE_MODEL', 'all-MiniLM-L6-v2')
+HF_CACHE_DIR = os.getenv('HF_HOME', os.path.join('/opt/render/project', '.cache', 'huggingface'))
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+
+def update_loading_status(status, message, progress):
+    """Update global loading status"""
+    global ml_loading_status
+    ml_loading_status = {'status': status, 'message': message, 'progress': progress}
+    print(f"[ML Loading] {message} ({progress}%)")
+
+def install_ml_packages():
+    """Install heavy ML packages only when needed (Text mode)."""
+    global ml_packages_installed
+    if ml_packages_installed:
+        return True
+    try:
+        import subprocess, sys
+        update_loading_status('installing', 'Installing text ML packages...', 10)
+
+        # Live pulse while pip runs
+        stop_event = threading.Event()
+        def _pulse_install():
+            local_progress = 12
+            while not stop_event.wait(1.2):
+                local_progress = min(45, local_progress + 2)
+                update_loading_status('installing', 'Installing text ML packages...', local_progress)
+        pulse_thread = threading.Thread(target=_pulse_install, daemon=True)
+        pulse_thread.start()
+
+        # Install sentence-transformers and numpy when user selects Text mode
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'sentence-transformers>=2.2.0', 'numpy>=1.24.0'])
+
+        stop_event.set()
+        pulse_thread.join(timeout=0.1)
+        ml_packages_installed = True
+        update_loading_status('packages_installed', 'Packages installed. Preparing model...', 50)
+        return True
+    except Exception as e:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+        update_loading_status('error', f'Failed to install ML packages: {e}', 0)
+        return False
+
+def get_embedder():
+    global embedder
+    global USE_HF_API
+    if embedder is None:
+        # If using HF API, no local model needed
+        if USE_HF_API and HF_API_TOKEN:
+            update_loading_status('ready', 'Using Hugging Face Inference API', 100)
+            return None
+        # Ensure required packages are present
+        if not install_ml_packages():
+            return None
+        try:
+            update_loading_status('loading_model', 'Downloading ML model (one-time setup)...', 60)
+            stop_event = threading.Event()
+            def _pulse_model():
+                local_progress = 62
+                while not stop_event.wait(1.2):
+                    local_progress = min(95, local_progress + 3)
+                    update_loading_status('loading_model', 'Downloading ML model (one-time setup)...', local_progress)
+            pulse_thread = threading.Thread(target=_pulse_model, daemon=True)
+            pulse_thread.start()
+            from sentence_transformers import SentenceTransformer
+            embedder = SentenceTransformer(MODEL_NAME, cache_folder=HF_CACHE_DIR)
+            stop_event.set()
+            pulse_thread.join(timeout=0.1)
+            update_loading_status('ready', 'ML model ready!', 100)
+        except Exception as e:
+            try:
+                stop_event.set()
+            except Exception:
+                pass
+            update_loading_status('error', f'Failed to load model: {e}', 0)
+            return None
+    return embedder
+
+def quick_similarity(text1, text2):
+    # Fast lexical similarity as a fallback
+    return float(difflib.SequenceMatcher(None, text1, text2).ratio())
+
+def semantic_similarity(text1, text2):
+    """Compute semantic similarity; always returns a float."""
+    try:
+        # Prefer Hugging Face Inference API if enabled (no local downloads)
+        if USE_HF_API and HF_API_TOKEN:
+            try:
+                api_url = f"https://api-inference.huggingface.co/models/{HF_MODEL_ID}"
+                headers = {"Authorization": f"Bearer {HF_API_TOKEN}"}
+                payload = {"inputs": {"source_sentence": text1, "sentences": [text2]}}
+                resp = requests.post(api_url, headers=headers, json=payload, timeout=30)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # API returns list of similarity scores
+                    return float(data[0]) if isinstance(data, list) and data else quick_similarity(text1, text2)
+                elif resp.status_code in (503, 524):
+                    # Model warming on HF; show intermediate status and fallback for now
+                    update_loading_status('loading_model', 'Warming Hugging Face model...', 60)
+                    return quick_similarity(text1, text2)
+                else:
+                    # Any error: fallback
+                    return quick_similarity(text1, text2)
+            except Exception as e:
+                print(f"[Semantic] HF API error: {e}")
+                return quick_similarity(text1, text2)
+        
+        # Local model path
+        model = get_embedder()
+        if model is None:
+            # Fallback to quick similarity if ML not available
+            return quick_similarity(text1, text2)
+        import numpy as np
+        embeddings = model.encode([text1, text2])
+        v1, v2 = np.array(embeddings[0]), np.array(embeddings[1])
+        denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+        if denom == 0:
+            return 0.0
+        return float(np.dot(v1, v2) / denom)
+    except Exception as e:
+        print(f"[Semantic] Fallback error: {e}")
+        # If the model isn't ready or any error occurs, use quick fallback
+        try:
+            return float(quick_similarity(text1, text2))
+        except Exception as e2:
+            print(f"[Semantic] Quick fallback failed: {e2}")
+            return 0.0
+
+def search_google_snippets(query, num_results=5):
+    # If API creds are not configured, skip online search gracefully
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID:
+        return []
+    url = 'https://www.googleapis.com/customsearch/v1'
+    params = {
+        'key': GOOGLE_API_KEY,
+        'cx': GOOGLE_CSE_ID,
+        'q': query,
+        'num': num_results
+    }
+    response = requests.get(url, params=params)
+    snippets = []
+    if response.status_code == 200:
+        data = response.json()
+        for item in data.get('items', []):
+            snippet = item.get('snippet', '')
+            if snippet:
+                snippets.append(snippet)
+    return snippets
+
+# Endpoint to proactively warm text model when user chooses Text mode
+@app.route('/warm-text-model', methods=['POST'])
+def warm_text_model():
+    # If using HF API, mark ready immediately (no local downloads)
+    if USE_HF_API and HF_API_TOKEN:
+        update_loading_status('ready', 'Using Hugging Face Inference API', 100)
+        return {'status': 'api_ready'}
+    # Else load locally in background
+    def _bg_load():
+        try:
+            _ = get_embedder()
+        except Exception:
+            pass
+    threading.Thread(target=_bg_load, daemon=True).start()
+    return {'status': 'started'}
+
+# Inference mode endpoints for UI toggle
+@app.route('/get-text-inference-mode', methods=['GET'])
+def get_text_inference_mode():
+    from flask import jsonify
+    return jsonify({'mode': 'api' if (USE_HF_API and HF_API_TOKEN) else 'local', 'has_token': bool(HF_API_TOKEN)})
+
+@app.route('/set-text-inference-mode', methods=['POST'])
+def set_text_inference_mode():
+    global USE_HF_API
+    try:
+        data = request.get_json(force=True) or {}
+        mode = (data.get('mode') or '').lower()
+        if mode == 'api':
+            if not HF_API_TOKEN:
+                return {'ok': False, 'error': 'HF_API_TOKEN not set'}, 400
+            USE_HF_API = True
+            update_loading_status('ready', 'Using Hugging Face Inference API', 100)
+            return {'ok': True, 'mode': 'api'}
+        elif mode == 'local':
+            USE_HF_API = False
+            update_loading_status('not_started', 'Local model will load on first use', 0)
+            return {'ok': True, 'mode': 'local'}
+        else:
+            return {'ok': False, 'error': 'Invalid mode'}, 400
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}, 500
+
+# ---------- Text helpers (ensemble similarity) ----------
+def _normalize_text(s: str) -> str:
+    return ' '.join(''.join(ch.lower() if ch.isalnum() or ch.isspace() else ' ' for ch in s).split())
+
+def _ngrams(s: str, n: int = 3) -> set:
+    words = _normalize_text(s).split()
+    if len(words) < n:
+        return set(words)  # fallback small sets
+    return {tuple(words[i:i+n]) for i in range(len(words) - n + 1)}
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a.intersection(b))
+    union = len(a.union(b))
+    return inter / union if union else 0.0
+
+def _phrase_coverage(a: str, b: str) -> float:
+    matcher = difflib.SequenceMatcher(None, a, b)
+    blocks = matcher.get_matching_blocks()
+    matched = sum(block.size for block in blocks)
+    avg_len = (len(a) + len(b)) / 2 or 1
+    return matched / avg_len
+
+def _extract_keywords(text: str, top_n: int = 5) -> list:
+    """Extract most common meaningful words (pseudo TF-IDF)"""
+    stop = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'is', 'are', 'was', 'were', 'be', 'been', 'to', 'of', 'for', 'with', 'from', 'by', 'as', 'if', 'this', 'that', 'these', 'those'}
+    words = _normalize_text(text).split()
+    words = [w for w in words if w not in stop and len(w) > 2]
+    from collections import Counter
+    freq = Counter(words)
+    return [w for w, _ in freq.most_common(top_n)]
+
+def _topic_similarity(text1: str, text2: str) -> float:
+    """Compare topics based on keyword overlap"""
+    kw1 = set(_extract_keywords(text1))
+    kw2 = set(_extract_keywords(text2))
+    return _jaccard(kw1, kw2)
+
+def _is_paraphrase(sem_score: float, lex_score: float) -> bool:
+    """High semantic + low lexical = likely paraphrase"""
+    return sem_score >= 0.75 and lex_score < 0.6
+
+def text_similarity(text1: str, text2: str) -> dict:
+    # Components
+    try:
+        sem = semantic_similarity(text1, text2)
+    except Exception:
+        sem = 0.0
+    lex = float(difflib.SequenceMatcher(None, text1, text2).ratio())
+    jac = _jaccard(_ngrams(text1, 3), _ngrams(text2, 3))
+    phr = _phrase_coverage(text1, text2)
+    topic = _topic_similarity(text1, text2)
+    
+    # Is it a paraphrase?
+    is_paraphrase = _is_paraphrase(sem, lex)
+
+    # Weighted ensemble (favor semantic for detecting paraphrases)
+    if is_paraphrase:
+        score = max(0.0, min(1.0, 0.65 * sem + 0.1 * lex + 0.15 * jac + 0.05 * phr + 0.05 * topic))
+    else:
+        score = max(0.0, min(1.0, 0.55 * sem + 0.15 * lex + 0.2 * jac + 0.1 * phr))
+    
+    # Reasoning
+    reasons = []
+    if sem >= 0.8:
+        reasons.append("High semantic similarity detected (meaning is very similar)")
+    elif is_paraphrase:
+        reasons.append("Likely paraphrasing detected (same ideas, different words)")
+    if jac >= 0.6:
+        reasons.append("High phrase overlap (similar phrases/concepts)")
+    if lex >= 0.7:
+        reasons.append("High textual similarity (wording is similar)")
+    if topic >= 0.7:
+        reasons.append("Same topic/keywords detected (discussing similar subjects)")
+    
+    return {
+        'semantic': sem,
+        'lexical': lex,
+        'ngram': jac,
+        'phrases': phr,
+        'topic': topic,
+        'score': score,
+        'is_paraphrase': is_paraphrase,
+        'reasons': reasons if reasons else ["Low similarity overall"],
+    }
+
+# ---------- Code helpers (AST + lexical) ----------
+import ast
+
+class _NormalizeNames(ast.NodeTransformer):
+    def visit_Name(self, node):
+        return ast.copy_location(ast.Name(id='VAR', ctx=node.ctx), node)
+    def visit_arg(self, node):
+        node.arg = 'ARG'
+        return node
+    def visit_FunctionDef(self, node):
+        node.name = 'FUNC'
+        self.generic_visit(node)
+        return node
+    def visit_ClassDef(self, node):
+        node.name = 'CLASS'
+        self.generic_visit(node)
+        return node
+    def visit_Constant(self, node):
+        # Replace strings/numbers with a token to reduce superficial differences
+        return ast.copy_location(ast.Constant(value='CONST'), node)
+
+def _normalize_code(code: str) -> str:
+    try:
+        tree = ast.parse(code)
+        tree = _NormalizeNames().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree) if hasattr(ast, 'unparse') else ast.dump(tree, include_attributes=False)
+    except Exception:
+        # Fallback: strip comments/whitespace
+        lines = [l for l in code.splitlines() if not l.strip().startswith('#')]
+        return '\n'.join(line.strip() for line in lines)
+
+def _node_types(code: str) -> set:
+    try:
+        tree = ast.parse(code)
+        return {type(n).__name__ for n in ast.walk(tree)}
+    except Exception:
+        return set()
+
+def code_similarity(code1: str, code2: str) -> dict:
+    n1 = _normalize_code(code1)
+    n2 = _normalize_code(code2)
+    lex = float(difflib.SequenceMatcher(None, n1, n2).ratio())
+    types1 = _node_types(code1)
+    types2 = _node_types(code2)
+    struct = _jaccard(types1, types2)
+    # Token-level ngram jaccard
+    jac = _jaccard(_ngrams(n1, 3), _ngrams(n2, 3))
+    score = max(0.0, min(1.0, 0.5 * lex + 0.3 * jac + 0.2 * struct))
+    return {
+        'lexical': lex,
+        'ngram': jac,
+        'structure': struct,
+        'score': score,
+    }
+
+# ---------- Image helpers (multi-hash ensemble) ----------
+def image_similarity(path1: str, path2: str) -> float:
+    img1 = Image.open(path1)
+    img2 = Image.open(path2)
+    hashes1 = [imagehash.phash(img1), imagehash.average_hash(img1), imagehash.dhash(img1)]
+    hashes2 = [imagehash.phash(img2), imagehash.average_hash(img2), imagehash.dhash(img2)]
+    sims = []
+    for h1, h2 in zip(hashes1, hashes2):
+        # All default to 64-bit hash
+        dist = h1 - h2
+        sims.append(1 - (dist / 64))
+    return float(sum(sims) / len(sims))
+
+@app.route('/ml-status', methods=['GET'])
+def ml_status():
+    """Endpoint to check ML loading status"""
+    from flask import jsonify
+    return jsonify(ml_loading_status)
+
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    result = None
+    if request.method == 'POST':
+        plagiarism_type = request.form.get('plagiarismType', 'image')
+        if plagiarism_type == 'image':
+            img1 = request.files.get('image1')
+            img2 = request.files.get('image2')
+            if img1 and img2:
+                path1 = os.path.join(app.config['UPLOAD_FOLDER'], img1.filename)
+                path2 = os.path.join(app.config['UPLOAD_FOLDER'], img2.filename)
+                img1.save(path1)
+                img2.save(path2)
+                similarity = image_similarity(path1, path2)
+                result = {
+                    'similarity': f"{similarity:.2f}",
+                    'plagiarized': similarity >= 0.9,
+                    'paraphrased': False,
+                    'online_similarity': None
+                }
+        elif plagiarism_type == 'text':
+            text1 = request.form.get('text1', '').strip()
+            text2 = request.form.get('text2', '').strip()
+            if text1 and text2:
+                try:
+                    comp = text_similarity(text1, text2)
+                    sim = comp['score']
+                    is_paraphrase = comp['is_paraphrase']
+                    reasons = comp['reasons']
+                    
+                    paraphrased = is_paraphrase and 0.75 < sim < 0.9
+                    plagiarized = sim >= 0.9
+                    result = {
+                        'similarity': f"{sim:.2f}",
+                        'plagiarized': plagiarized,
+                        'paraphrased': paraphrased,
+                        'online_similarity': None,
+                        'detection_type': 'Paraphrasing' if is_paraphrase else 'Direct Copy' if plagiarized else 'Similar Topic',
+                        'details': {
+                            'semantic_score': float(comp.get('semantic', 0)),
+                            'lexical_score': float(comp.get('lexical', 0)),
+                            'topic_match': float(comp.get('topic', 0)),
+                        },
+                        'reasons': reasons,
+                    }
+                except Exception as e:
+                    print(f"[Text Compare] Error: {e}")
+                    # Fallback: show basic comparison
+                    lex = float(difflib.SequenceMatcher(None, text1, text2).ratio())
+                    result = {
+                        'similarity': f"{lex:.2f}",
+                        'plagiarized': lex >= 0.9,
+                        'paraphrased': False,
+                        'online_similarity': None,
+                        'detection_type': 'Basic Comparison',
+                        'reasons': ['Fallback mode: basic lexical similarity used due to error'],
+                    }
+            elif text1:
+                # Only one text provided, check against online sources
+                snippets = search_google_snippets(text1)
+                max_sim = 0
+                best_snippet = ''
+                best_reasons = []
+                for snippet in snippets:
+                    comp = text_similarity(text1, snippet)
+                    sim = comp['score']
+                    if sim > max_sim:
+                        max_sim = sim
+                        best_snippet = snippet
+                        best_reasons = comp['reasons']
+                paraphrased = comp['is_paraphrase'] and 0.75 < max_sim < 0.9
+                plagiarized = max_sim >= 0.9
+                result = {
+                    'similarity': f"{max_sim:.2f}",
+                    'plagiarized': plagiarized,
+                    'paraphrased': paraphrased,
+                    'online_similarity': best_snippet if max_sim > 0.7 else None,
+                    'detection_type': 'Paraphrasing' if paraphrased else 'Direct Copy' if plagiarized else 'Similar Content',
+                    'reasons': best_reasons,
+                }
+        elif plagiarism_type == 'code':
+            code1 = request.form.get('code1', '').strip()
+            code2 = request.form.get('code2', '').strip()
+            if code1 and code2:
+                try:
+                    comp = code_similarity(code1, code2)
+                    sim = comp['score']
+                    paraphrased = 0.75 < sim < 0.9
+                    plagiarized = sim >= 0.9
+                    result = {
+                        'similarity': f"{sim:.2f}",
+                        'plagiarized': plagiarized,
+                        'paraphrased': paraphrased,
+                        'online_similarity': None
+                    }
+                except Exception as e:
+                    print(f"[Code Compare] Error: {e}")
+                    # Fallback: basic lexical comparison
+                    lex = float(difflib.SequenceMatcher(None, code1, code2).ratio())
+                    result = {
+                        'similarity': f"{lex:.2f}",
+                        'plagiarized': lex >= 0.9,
+                        'paraphrased': False,
+                        'online_similarity': None
+                    }
+    return render_template('index.html', result=result)
+
+if __name__ == '__main__':
+    # Don't preload model; let it lazy-load on first request to avoid startup timeout
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
